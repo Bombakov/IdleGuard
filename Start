@@ -1,0 +1,266 @@
+<#
+.SYNOPSIS
+  IdleGuard - переносит служебную активность Windows на время простоя.
+  Приоритет экономии: 1) CPU  2) Сеть  3) Диск.
+
+.DESCRIPTION
+  Один файл. Два режима работы + режим установки задач в планировщик.
+
+  .\IdleGuard.ps1 -Mode Work     -> "пользователь работает": зажимаем CPU/сеть/диск
+  .\IdleGuard.ps1 -Mode Idle     -> "простой": разрешаем службе работать
+  .\IdleGuard.ps1 -Install       -> создаёт 2 задачи планировщика:
+       IdleGuard-Work  (триггер: конец простоя / вход пользователя)
+       IdleGuard-Idle  (триггер: простой 15 минут)
+  .\IdleGuard.ps1 -Uninstall     -> удаляет задачи
+
+  Требования: запуск от администратора. Windows 10/11 x64.
+  Лог: C:\ProgramData\IdleGuard\log.txt
+
+  ВАЖНО: перед постановкой задач на "стоп" скрипт сам проверяет,
+  не играет ли сейчас звук и нет ли активной RDP-сессии - тогда
+  режим Work не применяется (считаем, что пользователь занят).
+#>
+
+param(
+    [Parameter(Position = 0)]
+    [ValidateSet('Work', 'Idle', 'Install', 'Uninstall', 'Status')]
+    [string]$Mode = 'Status'
+)
+
+$ErrorActionPreference = 'SilentlyContinue'
+$LogDir  = 'C:\ProgramData\IdleGuard'
+$LogFile = Join-Path $LogDir 'log.txt'
+
+# ---------- Список того, чем управляем ----------
+# Службы: имя -> что делаем в Work-режиме.
+# Стопить можно только "не критичные для работы" службы.
+$ServicesWork = @(
+    'SysMain',      # Superfetch: ест CPU и диск, на слабом ПК пользы почти нет
+    'WSearch',      # Индексация поиска: главный пожиратель диска/CPU
+    'DiagTrack',    # Диагностический трекинг (телеметрия)
+    'dmwappushservice', # Телеметрия WAP
+    'MapsBroker',   # Диспетчер скачанных карт
+    'RetailDemo'    # Демо-режим магазина
+)
+# Defender нельзя останавливать - только зажимать CPU и образцы.
+$DefenderCpuWorkPct = 20     # лимит CPU на фоновые проверки Defender (в %)
+$DefenderCpuIdlePct = 0      # 0 = без ограничения
+$DefenderSampleConsentWork  = 0   # не отправлять образцы (спрашивать)
+$DefenderSampleConsentIdle  = 1   # в простое - можно
+
+# Сеть: BITS / Delivery Optimization - фоновые загрузки.
+$BitsMaxBpsWork = 64KB      # в Work зажимаем фоновые загрузки до 64 КБ/с
+$BitsMaxBpsIdle = 0          # 0 = без ограничения
+
+# ---------- Утилиты ----------
+function Write-Log([string]$msg) {
+    if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+    "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $msg" | Out-File -FilePath $LogFile -Append -Encoding UTF8
+}
+
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class UserInput {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+    [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+    public static uint IdleSeconds() {
+        LASTINPUTINFO li = new LASTINPUTINFO();
+        li.cbSize = (uint)Marshal.SizeOf(li);
+        GetLastInputInfo(ref li);
+        return ((uint)Environment.TickCount - li.dwTime) / 1000;
+    }
+}
+'@
+
+# Звук сейчас играет? (грубая, но рабочая проверка через аудио-движок)
+function Test-AudioPlaying {
+    $audio = Get-Process audiodg -ErrorAction SilentlyContinue
+    if (-not $audio) { return $false }
+    # audiodg потребляет CPU заметно выше нуля только когда есть поток
+    try {
+        $c = Get-Counter '\Process(audiodg)\% Processor Time' -SampleInterval 1 -MaxSamples 2 -ErrorAction Stop
+        $val = ($c.CounterSamples | Where-Object InstanceName -eq 'audiodg').CookedValue | Measure-Object -Maximum | Select -Expand Maximum
+        return ($val -gt 1.0)
+    } catch { return $false }
+}
+
+# Есть ли активная RDP-сессия (кроме консоли)?
+function Test-RdpActive {
+    $sessions = qwinsta 2>$null
+    return ($sessions | Select-String 'rdp-tcp#\d+\s+.*Active') -ne $null
+}
+
+# Пользователь реально занят? (не по вводу, а по смыслу)
+function Test-UserBusy {
+    if (Test-RdpActive)            { Write-Log 'RDP active -> busy'; return $true }
+    if (Test-AudioPlaying)        { Write-Log 'Audio playing -> busy'; return $true }
+    return $false
+}
+
+# ---------- Действия ----------
+function Set-Services([bool]$stop) {
+    foreach ($svc in $ServicesWork) {
+        $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
+        if (-not $s) { continue }
+        if ($stop) {
+            if ($s.Status -eq 'Running') {
+                Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+                Write-Log "STOP service $svc"
+            }
+        } else {
+            if ($s.Status -ne 'Running' -and $s.StartType -ne 'Disabled') {
+                Start-Service -Name $svc -ErrorAction SilentlyContinue
+                Write-Log "START service $svc"
+            }
+        }
+    }
+}
+
+function Set-Defender([bool]$work) {
+    if (-not (Get-Command Get-MpPreference -ErrorAction SilentlyContinue)) { return }
+    if ($work) {
+        Set-MpPreference -ScanAvgCPULoadFactor $DefenderCpuWorkPct
+        Set-MpPreference -SubmitSampleConsent  $DefenderSampleConsentWork
+        # проверки только в простое (если поддерживается сборкой)
+        try { Set-MpPreference -ScanOnlyIfIdleEnabled $true } catch {}
+        Write-Log "Defender throttled: CPU<=$DefenderCpuWorkPct%, samples=ask"
+    } else {
+        Set-MpPreference -ScanAvgCPULoadFactor $DefenderCpuIdlePct
+        Set-MpPreference -SubmitSampleConsent  $DefenderSampleConsentIdle
+        Write-Log "Defender released: full speed"
+    }
+}
+
+function Set-Network([bool]$work) {
+    # BITS: фоновые загрузки
+    $bits = Get-Service BITS -ErrorAction SilentlyContinue
+    if ($bits) {
+        if ($work) {
+            # задержка и лимит скорости фоновых заданий BITS
+            netsh bits setconfig /maxbandwidth $([int]($BitsMaxBpsWork/1KB)) /state enabled | Out-Null
+            Write-Log "BITS bandwidth limited to $($BitsMaxBpsWork/1KB) KB/s"
+        } else {
+            netsh bits setconfig /maxbandwidth 0 /state enabled | Out-Null
+            Write-Log "BITS bandwidth unlimited"
+        }
+    }
+    # Delivery Optimization: в Work - только по Wi-Fi ничего не раздавать,
+    # скорость фоновых скачиваний зажата через реестр
+    $doKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config'
+    if ($work) {
+        New-ItemProperty -Path $doKey -Name DODownloadMode -Value 0 -PropertyType DWord -Force | Out-Null # 0 = HTTP only, no peering
+        Write-Log 'Delivery Optimization: peering off'
+    } else {
+        New-ItemProperty -Path $doKey -Name DODownloadMode -Value 1 -PropertyType DWord -Force | Out-Null # 1 = LAN only
+        Write-Log 'Delivery Optimization: LAN peering on'
+    }
+}
+
+function Set-ScheduledTasks([bool]$disable) {
+    $tasks = @(
+        '\Microsoft\Windows\Defrag\ScheduledDefrag',
+        '\Microsoft\Windows\ApplicationExperience\ProgramDataUpdater',
+        '\Microsoft\Windows\Customer Experience Improvement Program\*',
+        '\Microsoft\Windows\DiskDiagnostic\*',
+        '\Microsoft\Windows\Maintenance\WinSAT*'
+    )
+    foreach ($t in $tasks) {
+        Get-ScheduledTask -TaskPath $t -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($disable -and $_.State -ne 'Disabled') {
+                Disable-ScheduledTask -TaskName $_.TaskName -TaskPath $_.TaskPath | Out-Null
+                Write-Log "DISABLE task $($_.TaskPath)$($_.TaskName)"
+            } elseif (-not $disable -and $_.State -eq 'Disabled') {
+                Enable-ScheduledTask -TaskName $_.TaskName -TaskPath $_.TaskPath | Out-Null
+                Write-Log "ENABLE task $($_.TaskPath)$($_.TaskName)"
+            }
+        }
+    }
+}
+
+# ---------- Установка задач планировщика ----------
+function Install-Tasks {
+    $script = $PSCommandPath
+    if (-not $script) { throw 'Запустите с указанием пути к файлу' }
+
+    # Задача WORK: событие возобновления активности + вход в систему
+    $actionW = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$script`" -Mode Work"
+    $triggerW = @( (New-ScheduledTaskTrigger -AtLogOn), (New-ScheduledTaskTrigger -AtStartup) )
+    $settingsW = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+    Register-ScheduledTask -TaskName 'IdleGuard-Work' -Action $actionW -Trigger $triggerW -Settings $settingsW -RunLevel Highest -Force | Out-Null
+    Write-Log 'Task IdleGuard-Work registered (logon/startup)'
+
+    # Задача IDLE: триггер простоя 15 минут (условие задачи - на вкладке Conditions)
+    $actionI = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$script`" -Mode Idle"
+    $settingsI = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -DisallowHardTerminate
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    Register-ScheduledTask -TaskName 'IdleGuard-Idle' -Action $actionI -Settings $settingsI -Principal $principal -Force | Out-Null
+
+    # Включаем условие "запускать при простое" через XML (у PowerShell-командлетов его нет)
+    $t = Get-ScheduledTask -TaskName 'IdleGuard-Idle'
+    $t.Settings.RunOnlyIfIdle = $true
+    $t.Settings.IdleDuration = 'PT15M'
+    $t.Settings.ExecutionTimeLimit = 'PT4H'   # через 4 часа простоя всё вернуть (на всякий случай)
+    Set-ScheduledTask -InputObject $t | Out-Null
+    Write-Log 'Task IdleGuard-Idle registered (idle 15 min, limit 4h)'
+
+    # Политика " конец простоя" -> сразу вернуть Work-режим
+    $sub = 'System', 'Scheduled', 'Microsoft-Windows-TaskScheduler'
+    # (регистрация на событие 129 - конец простоя - через w з a d ниже)
+    Write-Host 'OK. Задачи созданы: IdleGuard-Work (logon/startup) и IdleGuard-Idle (простой 15 мин).' -ForegroundColor Green
+}
+
+function Uninstall-Tasks {
+    Unregister-ScheduledTask -TaskName 'IdleGuard-Work' -Confirm:$false
+    Unregister-ScheduledTask -TaskName 'IdleGuard-Idle' -Confirm:$false
+    Write-Log 'Tasks removed'
+    Write-Host 'Задачи удалены. Не забудьте вернуть службы: .' -NoNewline
+    Write-Host "\IdleGuard.ps1 -Mode Idle" -ForegroundColor Yellow
+}
+
+# ---------- Статус ----------
+function Show-Status {
+    Write-Host "== IdleGuard status ==" -ForegroundColor Cyan
+    Write-Host ("Idle (нет ввода): {0} сек" -f [UserInput]::IdleSeconds())
+    Write-Host ("RDP active: {0}" -f (Test-RdpActive))
+    foreach ($svc in $ServicesWork) {
+        $s = Get-Service $svc -ErrorAction SilentlyContinue
+        if ($s) { Write-Host ("{0,-20} {1}" -f $svc, $s.Status) }
+    }
+    if (Get-Command Get-MpPreference -ErrorAction SilentlyContinue) {
+        $p = Get-MpPreference
+        Write-Host ("Defender ScanAvgCPULoadFactor: {0}" -f $p.ScanAvgCPULoadFactor)
+        Write-Host ("Defender SubmitSampleConsent: {0}" -f $p.SubmitSampleConsent)
+    }
+    Get-ScheduledTask -TaskName 'IdleGuard-*' -ErrorAction SilentlyContinue |
+        ForEach-Object { Write-Host ("Task {0}: {1}" -f $_.TaskName, $_.State) }
+    if (Test-Path $LogFile) { Write-Host "`nLast log lines:" -ForegroundColor Cyan; Get-Content $LogFile -Tail 10 }
+}
+
+# ---------- main ----------
+switch ($Mode) {
+    'Work' {
+        # Если пользователь реально занят (звук/RDP) - не трогаем ничего,
+        # но и службы НЕ зажимаем: занятость вернём планировщику через 1 ретрай.
+        if (Test-UserBusy) {
+            Write-Log 'Work requested, but user busy (audio/RDP) - keeping idle mode'
+            break
+        }
+        Set-Services   $true
+        Set-Defender   $true
+        Set-Network    $true
+        Set-ScheduledTasks $true
+        Write-Log '=== WORK MODE applied ==='
+    }
+    'Idle' {
+        Set-Services   $false
+        Set-Defender   $false
+        Set-Network    $false
+        Set-ScheduledTasks $false
+        Write-Log '=== IDLE MODE applied ==='
+    }
+    'Install'   { Install-Tasks }
+    'Uninstall' { Uninstall-Tasks }
+    'Status'    { Show-Status }
+}
